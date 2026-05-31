@@ -20,18 +20,20 @@ Created: 2026-05-31
 
 Usage patterns
 --------------
-# 1. Scrape only
+# 1. Standalone – no config needed
 success, df = WikiplastScraper().scrape()
 if success:
     print(df)
 
-# 2. Scrape with CSV export
-config = Config(output_csv="wikiplast_prices.csv")
-success, df = WikiplastScraper(config).scrape()
+# 2. With app-level Config from config.py (retry settings are reused)
+from config import Config
+config = Config.from_env()
+success, df = WikiplastScraper(config=config).scrape()
 
-# 3. Custom retries and timeout
-config = Config(max_retries=5, timeout=60)
-success, df = WikiplastScraper(config).scrape()
+# 3. With ScraperConfig for full HTTP control
+from wikiplast_scraper import ScraperConfig
+scraper_cfg = ScraperConfig(max_retries=5, timeout=60, output_csv="out.csv")
+success, df = WikiplastScraper(config=scraper_cfg).scrape()
 """
 
 import sys
@@ -39,8 +41,8 @@ import logging
 import time
 import random
 import re
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, Union
 
 import requests
 import pandas as pd
@@ -77,22 +79,28 @@ COLUMN_INDICES = {
 }
 
 
-# ===== CONFIGURATION =====
+# ===== SCRAPER-SPECIFIC CONFIGURATION =====
 
 @dataclass
-class Config:
+class ScraperConfig:
     """
-    Runtime configuration for the Wikiplast scraper.
+    HTTP-level configuration for WikiplastScraper.
+
+    Use this when you want full control over scraper behaviour without
+    setting up a database. When an app-level Config (from config.py) is
+    passed to WikiplastScraper instead, its retry.max_attempts and
+    database.connection_timeout values are mapped onto these fields
+    automatically.
 
     Attributes:
-        url (str): Target URL for the price widget. Defaults to WIKIPLAST_WIDGET_URL.
-        max_retries (int): Number of HTTP retry attempts before giving up. Defaults to 3.
-        timeout (int): Per-request timeout in seconds. Defaults to 30.
-        output_csv (Optional[str]): File path for CSV export. If None, no file is written.
+        url (str): Target URL for the price widget.
+        max_retries (int): HTTP retry attempts before giving up.
+        timeout (int): Per-request timeout in seconds.
+        output_csv (Optional[str]): Path for CSV export; None disables export.
         user_agent (str): User-Agent header sent with each request.
 
     Example:
-        >>> cfg = Config(output_csv="prices.csv", max_retries=5)
+        >>> cfg = ScraperConfig(output_csv="prices.csv", max_retries=5)
         >>> cfg.url
         'https://www.wikiplast.com/widget/price/'
     """
@@ -101,6 +109,46 @@ class Config:
     timeout: int = DEFAULT_TIMEOUT
     output_csv: Optional[str] = None
     user_agent: str = DEFAULT_USER_AGENT
+
+
+def _resolve_scraper_config(config) -> ScraperConfig:
+    """
+    Normalise any config object into a ScraperConfig.
+
+    Accepts:
+      - None                  → default ScraperConfig()
+      - ScraperConfig         → returned as-is
+      - app-level Config      → retry.max_attempts and database.connection_timeout
+                                are mapped; all other HTTP defaults are kept
+
+    Args:
+        config: One of None, ScraperConfig, or the app-level Config dataclass.
+
+    Returns:
+        ScraperConfig: A fully-populated scraper configuration.
+    """
+    if config is None:
+        return ScraperConfig()
+
+    if isinstance(config, ScraperConfig):
+        return config
+
+    # App-level Config from config.py – extract what we need
+    try:
+        max_retries = config.retry.max_attempts
+    except AttributeError:
+        max_retries = DEFAULT_MAX_RETRIES
+
+    try:
+        timeout = config.database.connection_timeout
+    except AttributeError:
+        timeout = DEFAULT_TIMEOUT
+
+    logger.debug(
+        f"App-level Config detected – mapped retry.max_attempts={max_retries}, "
+        f"database.connection_timeout={timeout} into ScraperConfig"
+    )
+    return ScraperConfig(max_retries=max_retries, timeout=timeout)
 
 
 # ===== RESULT CONTAINER =====
@@ -285,12 +333,12 @@ class WikiplastScraper:
     """
     Scraper for petrochemical product prices published on Wikiplast.com.
 
-    Fetches the price widget page, extracts the embedded HTML table via
-    a document.write() pattern, and returns a clean DataFrame. Supports
-    optional CSV export.
+    Accepts either a ScraperConfig (for standalone use) or the app-level
+    Config from config.py (for full-pipeline use with DB). When an app-level
+    Config is supplied, retry and timeout values are mapped automatically.
 
     Attributes:
-        config (Config): Runtime configuration (URL, retries, timeout, output path).
+        config (ScraperConfig): Resolved HTTP configuration.
         logger (logging.Logger): Module-level logger instance.
 
     Example:
@@ -300,19 +348,21 @@ class WikiplastScraper:
         ...     print(df[["عنوان", "قیمت (ريال)"]].head())
     """
 
-    def __init__(self, config: Optional[Config] = None) -> None:
+    def __init__(self, config=None) -> None:
         """
-        Initialise the scraper with an optional configuration object.
+        Initialise the scraper.
 
         Args:
-            config (Config, optional): Custom configuration. If None, a default
-                Config() instance is used.
+            config: One of:
+                - None (default ScraperConfig is used)
+                - ScraperConfig (full HTTP control)
+                - app-level Config from config.py (retry + timeout are reused)
 
         Example:
-            >>> cfg = Config(max_retries=5, output_csv="out.csv")
-            >>> scraper = WikiplastScraper(config=cfg)
+            >>> from config import Config
+            >>> scraper = WikiplastScraper(config=Config.from_env())
         """
-        self.config = config or Config()
+        self.config: ScraperConfig = _resolve_scraper_config(config)
         self.logger = logging.getLogger(self.__class__.__name__)
 
     def scrape(self) -> Tuple[bool, Optional[pd.DataFrame]]:
@@ -383,7 +433,7 @@ class WikiplastScraper:
             df (pd.DataFrame): DataFrame to export.
 
         Example:
-            >>> cfg = Config(output_csv="wikiplast_prices.csv")
+            >>> cfg = ScraperConfig(output_csv="wikiplast_prices.csv")
             >>> scraper = WikiplastScraper(config=cfg)
             >>> ok, df = scraper.scrape()
             # CSV written to wikiplast_prices.csv after successful scrape
@@ -415,7 +465,7 @@ def main() -> None:
         0  پلی‌اتیلن ...  1403/...  145,000      مارون
         ...
     """
-    config = Config(output_csv="wikiplast_prices.csv")
+    config = ScraperConfig(output_csv="wikiplast_prices.csv")
     scraper = WikiplastScraper(config=config)
     success, df = scraper.scrape()
 
