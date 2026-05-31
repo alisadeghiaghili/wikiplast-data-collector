@@ -1,13 +1,37 @@
 # -*- coding: utf-8 -*-
 """
 Wikiplast Petrochemical Price Scraper
+======================================
+Fetches polymer raw-material prices from wikiplast.com and returns them
+as a clean pandas DataFrame using the same Config / safe_request() pattern
+as ice-data-collector and tgju-data-collector.
 
-This module provides functionality to scrape real-time petrochemical product
-prices from Wikiplast.com and return them as a structured DataFrame. It handles
-HTTP requests with retry logic, HTML table parsing, and optional CSV export.
+Extracted columns:
+    - عنوان       (product title)
+    - زمان        (price timestamp from source)
+    - قیمت (ريال) (price in IRR)
+    - پتروشیمی   (petrochemical company)
 
+Dependencies: requests, beautifulsoup4, pandas
+No Selenium required – data is served as static HTML inside a JS widget.
+
+Author : Ali Sadeghi Aghili
 Created: 2026-05-31
-Author: sadeghi.a
+
+Usage patterns
+--------------
+# 1. Scrape only
+success, df = WikiplastScraper().scrape()
+if success:
+    print(df)
+
+# 2. Scrape with CSV export
+config = Config(output_csv="wikiplast_prices.csv")
+success, df = WikiplastScraper(config).scrape()
+
+# 3. Custom retries and timeout
+config = Config(max_retries=5, timeout=60)
+success, df = WikiplastScraper(config).scrape()
 """
 
 import sys
