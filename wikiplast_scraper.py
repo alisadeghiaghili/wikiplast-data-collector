@@ -16,6 +16,22 @@ No Selenium required – the data is served as static HTML.
 
 Author : Ali Sadeghi Aghili
 Created: 2026-05-31
+
+Usage patterns
+--------------
+# 1. Full pipeline (chain)
+success, df = WikiplastScraper().scrape().store()
+
+# 2. Scrape only
+result = WikiplastScraper().scrape()
+if result:
+    print(result.df)
+
+# 3. Store a pre-built DataFrame
+success, df = WikiplastScraper().store(existing_df)
+
+# 4. Legacy one-shot (backward-compatible)
+success, df = WikiplastScraper().scrape_and_store()
 """
 
 import logging
@@ -60,7 +76,7 @@ TARGET_COLS = [COL_TITLE, COL_TIME, COL_PRICE, COL_PETRO]
 
 
 # ---------------------------------------------------------------------------
-# Logging  (identical pattern to ice_scraper.py)
+# Logging
 # ---------------------------------------------------------------------------
 
 def _setup_logger(name: str, config: Config) -> logging.Logger:
@@ -99,9 +115,64 @@ def _extract_html_from_js(js_text: str) -> str:
     match = re.search(r'document\.write\("(.+)"\)', js_text, re.DOTALL)
     if match:
         raw = match.group(1)
-        raw = raw.replace('\\\\', '\\').replace('\\"', '"').replace("\\'"  , "'")
+        raw = raw.replace('\\\\', '\\').replace('\\"', '"').replace("\\'", "'")
         return raw
     return js_text
+
+
+# ---------------------------------------------------------------------------
+# ScrapeResult  –  chainable container returned by scrape()
+# ---------------------------------------------------------------------------
+
+class ScrapeResult:
+    """
+    Returned by WikiplastScraper.scrape().
+
+    Truthy when scraping succeeded; supports chaining into .store().
+
+    Examples
+    --------
+    result = scraper.scrape()
+
+    # Check success
+    if result:
+        print(result.df)
+
+    # Chain into store
+    success, df = scraper.scrape().store()
+    """
+
+    def __init__(
+        self,
+        scraper: "WikiplastScraper",
+        df: Optional[pd.DataFrame],
+        success: bool,
+    ) -> None:
+        self._scraper = scraper
+        self.df       = df
+        self.success  = success
+
+    # Makes `if result:` work naturally
+    def __bool__(self) -> bool:
+        return self.success and self.df is not None
+
+    def store(self) -> Tuple[bool, Optional[pd.DataFrame]]:
+        """
+        Push the scraped DataFrame to the database.
+
+        Returns
+        -------
+        (success: bool, df: pd.DataFrame | None)
+            Mirrors the signature of WikiplastScraper.store() so both
+            standalone and chained calls behave identically.
+        """
+        if not self:
+            self._scraper.logger.error(
+                "store() called on a failed ScrapeResult – nothing to save."
+            )
+            return False, None
+
+        return self._scraper.store(self.df)
 
 
 # ---------------------------------------------------------------------------
@@ -112,28 +183,28 @@ class WikiplastScraper:
     """
     Scraper for polymer raw-material prices published on wikiplast.ir.
 
-    Usage
-    -----
-    scraper = WikiplastScraper()
-    success, df = scraper.scrape_and_store()
+    Public API
+    ----------
+    scrape()              -> ScrapeResult          (chainable)
+    store(df)             -> Tuple[bool, DataFrame] (standalone)
+    scrape().store()      -> Tuple[bool, DataFrame] (chained pipeline)
+    scrape_and_store()    -> Tuple[bool, DataFrame] (legacy one-shot)
     """
 
     def __init__(self, config: Optional[Config] = None):
         self.config = config or Config.from_env()
         self.logger = _setup_logger(self.__class__.__name__, self.config)
 
-        # SQLAlchemy table schema (mirrors ice_scraper.py pattern)
         self.metadata = MetaData()
         self._define_table_schema()
 
         self.logger.info("WikiplastScraper initialised successfully")
 
     # ------------------------------------------------------------------
-    # Schema definition
+    # Schema
     # ------------------------------------------------------------------
 
     def _define_table_schema(self) -> None:
-        """Define DB table using SQLAlchemy 2.0 Table construct."""
         self.table = Table(
             self.config.database.table_name,
             self.metadata,
@@ -148,7 +219,7 @@ class WikiplastScraper:
         self.logger.debug(f"Table schema defined: {self.config.database.table_name}")
 
     # ------------------------------------------------------------------
-    # Scraping steps
+    # Internal steps
     # ------------------------------------------------------------------
 
     def _fetch_page(self) -> str:
@@ -156,9 +227,7 @@ class WikiplastScraper:
         resp = requests.get(WIDGET_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         resp.encoding = "utf-8"
-        self.logger.info(
-            f"Response: HTTP {resp.status_code}, {len(resp.text):,} chars"
-        )
+        self.logger.info(f"Response: HTTP {resp.status_code}, {len(resp.text):,} chars")
         return resp.text
 
     def _parse_html(self, raw: str) -> BeautifulSoup:
@@ -168,12 +237,6 @@ class WikiplastScraper:
         return soup
 
     def _extract_table(self, soup: BeautifulSoup) -> pd.DataFrame:
-        """
-        Locate the pricing <table> and build a raw DataFrame.
-
-        Widget column order (left-to-right):
-            0: عنوان | 1: قیمت (ریال) | 2: زمان | 3: پتروشیمی | 4+: other
-        """
         table = soup.find("table")
         if table is None:
             raise ValueError("No <table> found in the fetched content.")
@@ -186,7 +249,7 @@ class WikiplastScraper:
             cells = row.find_all("td")
             if not cells or len(cells) < 4:
                 continue
-            if row.get("class") and "ratehead" in row.get("class", []):
+            if "ratehead" in row.get("class", []):
                 continue
             if cells[0].get("colspan"):
                 continue
@@ -199,12 +262,8 @@ class WikiplastScraper:
             if not title or title == COL_TITLE:
                 continue
 
-            records.append({
-                COL_TITLE: title,
-                COL_TIME:  time_,
-                COL_PRICE: price,
-                COL_PETRO: petro,
-            })
+            records.append({COL_TITLE: title, COL_TIME: time_,
+                             COL_PRICE: price, COL_PETRO: petro})
 
         if not records:
             raise ValueError("Table parsed but no data rows were extracted.")
@@ -214,11 +273,10 @@ class WikiplastScraper:
         return df
 
     def _process_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Clean and enrich the raw DataFrame before DB insert."""
         df[COL_PRICE] = (
             df[COL_PRICE]
             .str.replace(",",  "", regex=False)
-            .str.replace("٬", "", regex=False)   # Persian thousand-separator
+            .str.replace("٬", "", regex=False)
             .pipe(pd.to_numeric, errors="coerce")
             .fillna(0)
             .astype("int64")
@@ -229,10 +287,8 @@ class WikiplastScraper:
         df["ScrapeTime"] = now.strftime("%H:%M:%S")
 
         df = df.rename(columns={
-            COL_TITLE: "Title",
-            COL_TIME:  "Time",
-            COL_PRICE: "Price",
-            COL_PETRO: "Petro",
+            COL_TITLE: "Title", COL_TIME: "Time",
+            COL_PRICE: "Price", COL_PETRO: "Petro",
         })
 
         initial = len(df)
@@ -245,26 +301,67 @@ class WikiplastScraper:
         return df
 
     # ------------------------------------------------------------------
-    # Database storage  (identical pattern to ice_scraper._save_to_database)
+    # Public: scrape()  →  ScrapeResult  (chainable)
     # ------------------------------------------------------------------
 
-    def _save_to_database(self, df: pd.DataFrame) -> bool:
+    def scrape(self) -> ScrapeResult:
         """
-        Push processed DataFrame to SQL Server using SQLAlchemy 2.0.
+        Fetch and process data from wikiplast.ir.
 
-        Uses the same create_engine() / inspect / to_sql pattern as
-        ice_scraper.py so the two scrapers share identical DB behaviour.
+        Returns a ScrapeResult that is truthy on success and can be
+        directly chained into .store():
+
+            success, df = scraper.scrape().store()
+
+        Or inspected standalone:
+
+            result = scraper.scrape()
+            if result:
+                do_something(result.df)
         """
+        self.logger.info("─── scrape() started ───")
+        try:
+            raw  = self._fetch_page()
+            soup = self._parse_html(raw)
+            df   = self._extract_table(soup)
+            df   = self._process_data(df)
+            self.logger.info("scrape() completed successfully.")
+            return ScrapeResult(scraper=self, df=df, success=True)
+
+        except requests.HTTPError as e:
+            self.logger.error(f"HTTP error: {e}")
+        except requests.RequestException as e:
+            self.logger.error(f"Network error: {e}")
+        except ValueError as e:
+            self.logger.error(f"Parsing error: {e}")
+        except Exception as e:
+            self.logger.exception(f"Unexpected error in scrape(): {e}")
+
+        return ScrapeResult(scraper=self, df=None, success=False)
+
+    # ------------------------------------------------------------------
+    # Public: store(df)  →  Tuple[bool, DataFrame]  (standalone)
+    # ------------------------------------------------------------------
+
+    def store(self, df: pd.DataFrame) -> Tuple[bool, Optional[pd.DataFrame]]:
+        """
+        Push a processed DataFrame to SQL Server.
+
+        Can be called standalone with any DataFrame, or is called
+        automatically when chaining: scraper.scrape().store()
+
+        Returns
+        -------
+        (success: bool, df: pd.DataFrame | None)
+        """
+        self.logger.info("─── store() started ───")
         try:
             self.logger.info(
-                f"Saving {len(df)} rows to "
-                f"'{self.config.database.table_name}'..."
+                f"Saving {len(df)} rows to '{self.config.database.table_name}'..."
             )
-
             engine = self.config.create_engine()
 
-            inspector = inspect(engine)
-            if not inspector.has_table(self.config.database.table_name):
+            if not inspect(engine).has_table(self.config.database.table_name):
                 self.logger.info(
                     f"Table not found – creating: {self.config.database.table_name}"
                 )
@@ -278,55 +375,39 @@ class WikiplastScraper:
                 method="multi",
                 chunksize=1000,
             )
-
             engine.dispose()
-            self.logger.info("Data saved to database successfully.")
-            return True
+            self.logger.info("store() completed successfully.")
+            return True, df
 
         except SQLAlchemyError as e:
             self.logger.error(f"Database error: {e}")
-            return False
         except Exception as e:
-            self.logger.error(f"Unexpected error saving to database: {e}")
-            return False
+            self.logger.error(f"Unexpected error in store(): {e}")
+
+        return False, None
 
     # ------------------------------------------------------------------
-    # Public orchestrator  (mirrors ice_scraper.scrape_and_store)
+    # Legacy: scrape_and_store()  –  backward-compatible one-shot
     # ------------------------------------------------------------------
 
     def scrape_and_store(self) -> Tuple[bool, Optional[pd.DataFrame]]:
         """
-        Execute the full scrape → process → store workflow.
+        Full pipeline in one call (backward-compatible).
 
-        Returns
-        -------
-        (success: bool, df: pd.DataFrame | None)
+        Equivalent to: scraper.scrape().store()
         """
         start = datetime.now()
         self.logger.info("─── Wikiplast scraping workflow started ───")
 
-        try:
-            raw  = self._fetch_page()
-            soup = self._parse_html(raw)
-            df   = self._extract_table(soup)
-            df   = self._process_data(df)
+        result = self.scrape()
+        if not result:
+            return False, None
 
-            success = self._save_to_database(df)
+        success, df = self.store(result.df)
 
-            elapsed = (datetime.now() - start).total_seconds()
-            self.logger.info(f"Workflow completed in {elapsed:.2f}s")
-            return success, df if success else None
-
-        except requests.HTTPError as e:
-            self.logger.error(f"HTTP error: {e}")
-        except requests.RequestException as e:
-            self.logger.error(f"Network error: {e}")
-        except ValueError as e:
-            self.logger.error(f"Parsing error: {e}")
-        except Exception as e:
-            self.logger.exception(f"Unexpected error: {e}")
-
-        return False, None
+        elapsed = (datetime.now() - start).total_seconds()
+        self.logger.info(f"Workflow completed in {elapsed:.2f}s")
+        return success, df
 
 
 # ---------------------------------------------------------------------------
