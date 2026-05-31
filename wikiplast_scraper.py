@@ -6,6 +6,15 @@ Fetches polymer raw-material prices from wikiplast.ir and returns them
 as a clean pandas DataFrame using the same Config / safe_request() pattern
 as ice-data-collector and tgju-data-collector.
 
+The endpoint ``wikiplast.ir/pricescodeime`` returns a JavaScript snippet
+like::
+
+    document.write("<link rel='stylesheet' ...><div id='econorate'><table>...</table></div>")
+
+This scraper extracts the HTML string from inside ``document.write(...)``
+and parses the embedded ``<table>`` with BeautifulSoup — no browser
+automation required.
+
 Extracted columns:
     - عنوان       (product title)
     - زمان        (price timestamp from source)
@@ -13,7 +22,6 @@ Extracted columns:
     - پتروشیمی   (petrochemical company)
 
 Dependencies: requests, beautifulsoup4, pandas
-No Selenium required – data is served as static HTML.
 
 Author : Ali Sadeghi Aghili
 Created: 2026-05-31
@@ -41,6 +49,7 @@ scraper_cfg = ScraperConfig(max_retries=5, timeout=60, output_csv="out.csv")
 result = WikiplastScraper(config=scraper_cfg).scrape()
 """
 
+import re
 import sys
 import logging
 import time
@@ -76,12 +85,11 @@ DEFAULT_TIMEOUT = 30
 RETRY_DELAY_MIN = 2
 RETRY_DELAY_JITTER = 1
 
-# The widget endpoint serves a full HTML page with the price table inline.
-# No JavaScript execution or document.write() extraction is needed.
-WIKIPLAST_WIDGET_URL = "https://wikiplast.ir/widget/price/"
+# The endpoint returns a JS file containing document.write("<html>...").
+# The HTML table with prices is embedded inside the JS string.
+WIKIPLAST_WIDGET_URL = "https://wikiplast.ir/pricescodeime"
 
-# Column names as they appear in the source HTML <th> cells.
-# Index positions map directly to <td> order inside each <tr>.
+# Column names and their index positions inside each <tr>.
 OUTPUT_COLUMNS = ["عنوان", "زمان", "قیمت (ریال)", "پتروشیمی"]
 COLUMN_INDICES: dict[str, int] = {
     "عنوان": 0,
@@ -99,14 +107,8 @@ class ScraperConfig:
     """
     HTTP-level configuration for WikiplastScraper.
 
-    Use this when you want full control over scraper behaviour without
-    setting up a database connection.  When an app-level Config (from
-    config.py) is passed to WikiplastScraper instead, its
-    ``retry.max_attempts`` and ``database.connection_timeout`` values are
-    mapped onto these fields automatically.
-
     Attributes:
-        url (str): Target URL for the price widget.
+        url (str): Target URL for the price widget JS endpoint.
         max_retries (int): HTTP retry attempts before giving up.
         timeout (int): Per-request timeout in seconds.
         output_csv (Optional[str]): Path for CSV export; None disables export.
@@ -120,41 +122,22 @@ class ScraperConfig:
 
 
 def _resolve_scraper_config(config) -> ScraperConfig:
-    """
-    Normalise any config object into a ScraperConfig.
-
-    Accepts:
-      - ``None``              → default ScraperConfig()
-      - ``ScraperConfig``     → returned as-is
-      - app-level ``Config``  → retry.max_attempts and
-                                database.connection_timeout are mapped;
-                                all other HTTP defaults are kept
-
-    Returns:
-        ScraperConfig: A fully-populated scraper configuration.
-    """
+    """Normalise any config object into a ScraperConfig."""
     if config is None:
         return ScraperConfig()
-
     if isinstance(config, ScraperConfig):
         return config
-
-    # App-level Config from config.py – extract what we need
     try:
         max_retries = config.retry.max_attempts
     except AttributeError:
         max_retries = DEFAULT_MAX_RETRIES
-
     try:
         timeout = config.database.connection_timeout
     except AttributeError:
         timeout = DEFAULT_TIMEOUT
-
     logger.debug(
-        "App-level Config detected – mapped retry.max_attempts=%d, "
-        "database.connection_timeout=%d into ScraperConfig",
-        max_retries,
-        timeout,
+        "App-level Config mapped: retry.max_attempts=%d, connection_timeout=%d",
+        max_retries, timeout,
     )
     return ScraperConfig(max_retries=max_retries, timeout=timeout)
 
@@ -165,24 +148,13 @@ class ScrapeResult:
     """
     Container returned by ``WikiplastScraper.scrape()``.
 
-    Supports **two usage patterns** so existing code keeps working:
-
-    Attribute access (recommended)::
+    Supports attribute access and tuple unpacking::
 
         result = scraper.scrape()
-        if result:            # bool(result) == result.success
-            print(result.df)  # the DataFrame
-
-    Tuple unpacking (backward compatible)::
+        if result:
+            print(result.df)
 
         success, df = scraper.scrape()
-
-    Attributes:
-        success (bool): True if scraping and parsing both succeeded.
-        df (Optional[pd.DataFrame]): DataFrame with columns
-            [عنوان, زمان, قیمت (ریال), پتروشیمی], or None on failure.
-        rows_fetched (int): Number of data rows extracted (0 on failure).
-        error (Optional[str]): Human-readable error description, or None on success.
     """
 
     __slots__ = ("success", "df", "rows_fetched", "error")
@@ -200,15 +172,9 @@ class ScrapeResult:
         self.error = error
 
     def __bool__(self) -> bool:
-        """Allow ``if result:`` checks."""
         return self.success
 
     def __iter__(self) -> Iterator:
-        """
-        Enable tuple unpacking::
-
-            success, df = scraper.scrape()
-        """
         yield self.success
         yield self.df
 
@@ -226,17 +192,9 @@ def safe_request(
     timeout: int = DEFAULT_TIMEOUT,
 ) -> Optional[requests.Response]:
     """
-    Execute an HTTP GET request with automatic retry logic and error handling.
+    Execute an HTTP GET with automatic retry and back-off.
 
-    Args:
-        url (str): Target URL for the GET request.
-        headers (dict, optional): HTTP headers to include.
-        max_retries (int): Maximum number of attempts.  Defaults to 3.
-        timeout (int): Per-request timeout in seconds.  Defaults to 30.
-
-    Returns:
-        requests.Response: Successful response object, or None if all
-        retries are exhausted.
+    Returns the Response on success, or None after all retries are exhausted.
     """
     for attempt in range(max_retries):
         try:
@@ -244,20 +202,48 @@ def safe_request(
             response.raise_for_status()
             logger.debug("Fetched %s (attempt %d)", url, attempt + 1)
             return response
-
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as err:
             logger.warning("Attempt %d/%d failed for %s: %s", attempt + 1, max_retries, url, err)
-
         except (requests.exceptions.HTTPError, requests.exceptions.RequestException) as err:
             logger.warning("Attempt %d/%d failed for %s: %s", attempt + 1, max_retries, url, err)
-
         if attempt < max_retries - 1:
             delay = RETRY_DELAY_MIN + random.random() * RETRY_DELAY_JITTER
             logger.debug("Waiting %.2fs before retry…", delay)
             time.sleep(delay)
-
     logger.error("Failed to fetch %s after %d retries.", url, max_retries)
     return None
+
+
+# ===== JS UNWRAP MODULE =====
+
+def _extract_html_from_js(js_text: str) -> Optional[str]:
+    """
+    Extract the HTML string from inside a ``document.write("...")`` call.
+
+    The wikiplast.ir/pricescodeime endpoint returns JavaScript like::
+
+        document.write("<link ...><div id='econorate'><table>...</table></div>")
+
+    This function strips the ``document.write(...)`` wrapper and returns
+    the raw HTML string so it can be fed to BeautifulSoup.
+
+    Args:
+        js_text (str): Raw response text from the widget endpoint.
+
+    Returns:
+        str: Extracted HTML content, or None if the pattern is not found.
+    """
+    match = re.search(r'document\.write\("(.+)"\)', js_text, re.DOTALL)
+    if not match:
+        logger.error(
+            "Could not find document.write(...) pattern in response. "
+            "Response preview: %s", js_text[:300]
+        )
+        return None
+    # Unescape JS-escaped double quotes that may appear inside the string
+    html = match.group(1).replace('\\"', '"')
+    logger.debug("Extracted %d chars of HTML from document.write().", len(html))
+    return html
 
 
 # ===== HTML PARSING MODULE =====
@@ -266,53 +252,34 @@ def _parse_price_table(html: str) -> Optional[pd.DataFrame]:
     """
     Parse the Wikiplast price HTML table into a structured DataFrame.
 
-    The widget endpoint at wikiplast.ir/widget/price/ delivers a standalone
-    HTML page; this function locates the first ``<table>`` element and
-    extracts product rows.
-
-    Processing steps:
-
-    1. Parse HTML with BeautifulSoup.
-    2. Locate the first ``<table>`` element.
-    3. Iterate over ``<tr>`` rows, skipping:
-
-       - Header rows (``class='ratehead'``)
-       - Banner/title rows (any cell carries a ``colspan`` attribute)
-       - Short rows with fewer cells than required
-
-    4. Extract text from each ``<td>`` at the fixed column indices
-       defined in :data:`COLUMN_INDICES`.
-    5. Assemble rows into a DataFrame with columns in
-       :data:`OUTPUT_COLUMNS` order.
+    Skips:
+    - Header rows (``class='ratehead'``)
+    - Banner rows (any cell with a ``colspan`` attribute)
+    - Rows with fewer cells than required
 
     Args:
-        html (str): Raw HTML string of the widget page.
+        html (str): HTML string containing the price ``<table>``.
 
     Returns:
-        pd.DataFrame: DataFrame with columns
-        [عنوان, زمان, قیمت (ریال), پتروشیمی] and one row per product,
-        or None if the table cannot be found or no valid data rows exist.
+        pd.DataFrame or None.
     """
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table")
     if table is None:
-        logger.error("No <table> element found in widget HTML.")
+        logger.error("No <table> element found in extracted HTML.")
         return None
 
     rows_data = []
     for tr in table.find_all("tr"):
         if "ratehead" in tr.get("class", []):
             continue
-
         cells = tr.find_all("td")
-
         if not cells:
             continue
         if any(cell.get("colspan") for cell in cells):
             continue
         if len(cells) < _MIN_REQUIRED_CELLS:
             continue
-
         rows_data.append({
             col_name: cells[idx].get_text(strip=True)
             for col_name, idx in COLUMN_INDICES.items()
@@ -331,51 +298,30 @@ def _parse_price_table(html: str) -> Optional[pd.DataFrame]:
 
 class WikiplastScraper:
     """
-    Scraper for petrochemical product prices published on wikiplast.ir.
-
-    Accepts either a :class:`ScraperConfig` (for standalone use) or the
-    app-level ``Config`` from ``config.py`` (for full-pipeline use with DB).
-    When an app-level Config is supplied, retry and timeout values are
-    mapped automatically via :func:`_resolve_scraper_config`.
+    Scraper for petrochemical product prices on wikiplast.ir.
 
     Example::
 
-        # Recommended — attribute access
         result = WikiplastScraper().scrape()
         if result:
             print(result.df.head())
-
-        # Backward compatible — tuple unpacking
-        success, df = WikiplastScraper().scrape()
     """
 
     def __init__(self, config=None) -> None:
-        """
-        Initialise the scraper.
-
-        Args:
-            config: One of:
-
-                - ``None``                  → default ScraperConfig is used
-                - :class:`ScraperConfig`    → full HTTP control
-                - app-level ``Config``      → retry + timeout are reused
-        """
         self.config: ScraperConfig = _resolve_scraper_config(config)
         self.logger = logging.getLogger(self.__class__.__name__)
 
     def scrape(self) -> ScrapeResult:
         """
-        Run the full scrape pipeline and return a :class:`ScrapeResult`.
+        Run the full scrape pipeline.
 
-        Workflow:
-
-        1. Send HTTP GET to ``wikiplast.ir/widget/price/`` (with retry logic).
-        2. Parse the price table from the raw HTML response.
-        3. Optionally export the DataFrame to CSV.
+        1. Fetch the JS endpoint at wikiplast.ir/pricescodeime.
+        2. Extract the HTML string from inside document.write(...).
+        3. Parse the price table.
+        4. Optionally export to CSV.
 
         Returns:
-            ScrapeResult: Always returned.  Check ``result.success`` or
-            use ``if result:`` to test for success.
+            ScrapeResult
         """
         self.logger.info("=" * 60)
         self.logger.info("Starting Wikiplast scraper")
@@ -392,10 +338,14 @@ class WikiplastScraper:
             return ScrapeResult(success=False, error="HTTP request failed after all retries.")
 
         response.encoding = "utf-8"
-        df = _parse_price_table(response.text)
 
+        html = _extract_html_from_js(response.text)
+        if html is None:
+            return ScrapeResult(success=False, error="Failed to extract HTML from document.write() response.")
+
+        df = _parse_price_table(html)
         if df is None or df.empty:
-            return ScrapeResult(success=False, error="Failed to parse price table from response.")
+            return ScrapeResult(success=False, error="Failed to parse price table from HTML.")
 
         self.logger.info("Successfully scraped %d product rows.", len(df))
 
@@ -405,15 +355,7 @@ class WikiplastScraper:
         return ScrapeResult(success=True, df=df, rows_fetched=len(df))
 
     def _save_csv(self, df: pd.DataFrame) -> None:
-        """
-        Write the DataFrame to CSV at the configured output path.
-
-        Uses UTF-8-BOM encoding so the file opens correctly in Microsoft
-        Excel without manual encoding configuration.
-
-        Args:
-            df (pd.DataFrame): DataFrame to export.
-        """
+        """Write DataFrame to CSV (UTF-8-BOM for Excel compatibility)."""
         try:
             df.to_csv(self.config.output_csv, index=False, encoding="utf-8-sig")
             self.logger.info("Data saved to '%s'.", self.config.output_csv)
@@ -424,22 +366,7 @@ class WikiplastScraper:
 # ===== ENTRY POINT =====
 
 def main() -> None:
-    """
-    CLI entry point — run the scraper and print a preview to stdout.
-
-    Example::
-
-        $ python wikiplast_scraper.py
-        ============================================================
-        Starting Wikiplast scraper
-        ============================================================
-        Successfully scraped 87 product rows.
-
-        Fetched 87 rows.
-
-           عنوان          زمان    قیمت (ریال)  پتروشیمی
-        0  PVC S65 Ghadir  ...
-    """
+    """CLI entry point — run the scraper and print a preview to stdout."""
     config = ScraperConfig(output_csv="wikiplast_prices.csv")
     scraper = WikiplastScraper(config=config)
     result = scraper.scrape()
