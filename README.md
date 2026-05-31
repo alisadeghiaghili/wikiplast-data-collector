@@ -1,7 +1,7 @@
 # Wikiplast Data Collector
 
 > Lightweight Python scraper for real-time polymer raw-material prices from
-> [wikiplast.com](https://www.wikiplast.com) — built with the same
+> [wikiplast.ir](https://wikiplast.ir) — built with the same
 > architecture as
 > [ice-data-collector](https://github.com/alisadeghiaghili/ice-data-collector)
 > and
@@ -22,7 +22,25 @@
 | 📄 **CSV export** | UTF-8-BOM output that opens natively in Microsoft Excel |
 | 🧩 **Dual return API** | `result.df` **and** `success, df = scraper.scrape()` both work |
 | 🔧 **Pluggable config** | Drop-in with the shared `Config` from `config.py` or standalone `ScraperConfig` |
-| 📝 **Structured logging** | Console + rotating file log at `wikiplast_scraper.log` |
+| 📝 **Structured logging** | Console + file log at `wikiplast_scraper.log` |
+
+---
+
+## How It Works
+
+The endpoint `wikiplast.ir/pricescodeime` does **not** return plain HTML.
+Instead it returns a JavaScript file containing a single `document.write(...)` call:
+
+```js
+document.write("<link rel='stylesheet' ...><div id='econorate'><table>...</table></div>")
+```
+
+This scraper:
+1. Fetches the JS file with `requests`.
+2. Extracts the HTML string from inside `document.write("...")` using regex.
+3. Parses the embedded `<table>` with `BeautifulSoup`.
+
+No browser automation needed.
 
 ---
 
@@ -107,7 +125,7 @@ config = Config.from_env()
 result = WikiplastScraper(config=config).scrape()
 
 if result:
-    print(result.df[['عنوان', 'قیمت (ریال)']].head(10))
+    print(result.df[[’عنوان’, ’قیمت (ریال)’]].head(10))
 ```
 
 ### With ScraperConfig for full HTTP control
@@ -165,7 +183,7 @@ RETRY_BACKOFF_FACTOR=2
 
 | Parameter | Default | Description |
 |---|---|---|
-| `url` | `https://www.wikiplast.com/widget/price/` | Widget endpoint |
+| `url` | `https://wikiplast.ir/pricescodeime` | JS widget endpoint |
 | `max_retries` | `3` | HTTP retry attempts |
 | `timeout` | `30` | Request timeout (seconds) |
 | `output_csv` | `None` | CSV export path (`None` disables export) |
@@ -176,11 +194,14 @@ RETRY_BACKOFF_FACTOR=2
 ## Data Pipeline
 
 ```
-wikiplast.com/widget/price/
+https://wikiplast.ir/pricescodeime
         │  (HTTP GET × 1–3 with jitter back-off)
         ▼
   safe_request()
-        │  (raw HTML response)
+        │  (raw JS response: document.write("..."))
+        ▼
+  _extract_html_from_js()       ← regex strips document.write() wrapper
+        │  (raw HTML string)
         ▼
   _parse_price_table()          ← BeautifulSoup HTML parser
         │  (pd.DataFrame)
@@ -216,8 +237,8 @@ All activity is written to both **stdout** and **`wikiplast_scraper.log`**.
 |---|---|
 | `INFO` | Scrape start / end, rows fetched, CSV saved |
 | `WARNING` | Retried HTTP attempts |
-| `ERROR` | Final HTTP failure, parse failure, CSV write error |
-| `DEBUG` | Per-attempt detail, retry delays, row counts |
+| `ERROR` | Final HTTP failure, JS parse failure, table parse failure, CSV write error |
+| `DEBUG` | Per-attempt detail, retry delays, extracted HTML size, row counts |
 
 Sample output:
 
@@ -235,10 +256,11 @@ Sample output:
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `Failed to fetch … after 3 retries` | Network / firewall / VPN | Check connectivity to `wikiplast.com`; increase `max_retries` |
-| `No <table> element found` | Site HTML structure changed | Open the widget URL in a browser and inspect the DOM |
-| `zero valid data rows` | All rows filtered out | Check `COLUMN_INDICES` against current `<td>` positions |
-| Persian text garbled in Excel | Wrong encoding | Always open the CSV via **Data → From Text/CSV** with UTF-8 |
+| `Failed to fetch … after 3 retries` | Network / firewall / VPN | Check connectivity to `wikiplast.ir`; increase `max_retries` |
+| `Could not find document.write(...) pattern` | Endpoint response format changed | Open `wikiplast.ir/pricescodeime` in a browser and check what it returns |
+| `No <table> element found` | HTML structure inside JS changed | Inspect extracted HTML string; check `_extract_html_from_js()` regex |
+| `zero valid data rows` | Column positions shifted | Check `COLUMN_INDICES` against current `<td>` order in the table |
+| Persian text garbled in Excel | Wrong encoding | Open the CSV via **Data → From Text/CSV** with UTF-8 |
 
 ---
 
