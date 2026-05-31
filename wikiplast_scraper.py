@@ -2,7 +2,7 @@
 """
 Wikiplast Petrochemical Price Scraper
 ======================================
-Fetches polymer raw-material prices from wikiplast.com and returns them
+Fetches polymer raw-material prices from wikiplast.ir and returns them
 as a clean pandas DataFrame using the same Config / safe_request() pattern
 as ice-data-collector and tgju-data-collector.
 
@@ -78,7 +78,7 @@ RETRY_DELAY_JITTER = 1
 
 # The widget endpoint serves a full HTML page with the price table inline.
 # No JavaScript execution or document.write() extraction is needed.
-WIKIPLAST_WIDGET_URL = "https://www.wikiplast.com/widget/price/"
+WIKIPLAST_WIDGET_URL = "https://wikiplast.ir/widget/price/"
 
 # Column names as they appear in the source HTML <th> cells.
 # Index positions map directly to <td> order inside each <tr>.
@@ -199,8 +199,6 @@ class ScrapeResult:
         self.rows_fetched = rows_fetched
         self.error = error
 
-    # ----- bool / tuple protocol -----
-
     def __bool__(self) -> bool:
         """Allow ``if result:`` checks."""
         return self.success
@@ -229,12 +227,6 @@ def safe_request(
 ) -> Optional[requests.Response]:
     """
     Execute an HTTP GET request with automatic retry logic and error handling.
-
-    Implements resilience patterns for transient network failures:
-
-    - Retries on timeout or connection errors with a short random back-off
-    - Validates HTTP status codes via ``raise_for_status()``
-    - Logs every attempt and final failure at appropriate log levels
 
     Args:
         url (str): Target URL for the GET request.
@@ -274,8 +266,9 @@ def _parse_price_table(html: str) -> Optional[pd.DataFrame]:
     """
     Parse the Wikiplast price HTML table into a structured DataFrame.
 
-    The widget endpoint delivers a standalone HTML page; this function
-    locates the first ``<table>`` element and extracts product rows.
+    The widget endpoint at wikiplast.ir/widget/price/ delivers a standalone
+    HTML page; this function locates the first ``<table>`` element and
+    extracts product rows.
 
     Processing steps:
 
@@ -308,13 +301,11 @@ def _parse_price_table(html: str) -> Optional[pd.DataFrame]:
 
     rows_data = []
     for tr in table.find_all("tr"):
-        # skip header rows
         if "ratehead" in tr.get("class", []):
             continue
 
         cells = tr.find_all("td")
 
-        # skip title/banner rows and rows that are too short
         if not cells:
             continue
         if any(cell.get("colspan") for cell in cells):
@@ -340,7 +331,7 @@ def _parse_price_table(html: str) -> Optional[pd.DataFrame]:
 
 class WikiplastScraper:
     """
-    Scraper for petrochemical product prices published on Wikiplast.com.
+    Scraper for petrochemical product prices published on wikiplast.ir.
 
     Accepts either a :class:`ScraperConfig` (for standalone use) or the
     app-level ``Config`` from ``config.py`` (for full-pipeline use with DB).
@@ -378,20 +369,13 @@ class WikiplastScraper:
 
         Workflow:
 
-        1. Send HTTP GET to the configured widget URL (with retry logic).
+        1. Send HTTP GET to ``wikiplast.ir/widget/price/`` (with retry logic).
         2. Parse the price table from the raw HTML response.
         3. Optionally export the DataFrame to CSV.
 
         Returns:
             ScrapeResult: Always returned.  Check ``result.success`` or
             use ``if result:`` to test for success.
-
-        Example::
-
-            result = WikiplastScraper().scrape()
-            if result:
-                print(f"Fetched {result.rows_fetched} products.")
-                print(result.df)
         """
         self.logger.info("=" * 60)
         self.logger.info("Starting Wikiplast scraper")
